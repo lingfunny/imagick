@@ -1,27 +1,22 @@
 #include <cstdlib>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include <opencv2/core.hpp>
 
 #include "ImageLoader.hpp"
+#include "ImageOps.hpp"
 
 namespace {
 
 enum class OperationType {
-    ToGray,
-    Resize,
-    Scale,
-    Rotate,
-    Normalize,
     Compress,
     Decompress,
-    Save,
-    Display
+    Grayscale,
+    ScalePercent,
+    DumpTriples
 };
 
 struct Operation {
@@ -30,107 +25,86 @@ struct Operation {
 };
 
 struct CLIConfig {
-    bool infoOnly = false;
-    std::optional<bool> forceAscii; // true 表示 P2/P3，false 表示 P6
-    std::optional<int> maxValueOverride;
-    bool keepMetadata = false;
     std::string inputPath;
-    std::string outputPath = "null:";
+    std::string outputPath;
     std::vector<Operation> operations;
 };
 
 void printUsage(std::ostream& os) {
-    os << "用法: imagick [全局选项] <输入> [操作 ...] <输出>\n"
-       << "示例: imagick data/color-block.ppm -to-gray out.pgm\n\n"
-       << "全局选项:\n"
-       << "  --help             显示本帮助并退出\n"
-       << "  --info             仅输出输入资源的元数据\n"
-       << "  --ascii            强制以 P2/P3 ASCII 格式写出\n"
-       << "  --binary           强制以 P6 二进制格式写出\n"
-       << "  --max-value <n>    指定写出图像的最大像素值\n"
-       << "  --keep-metadata    预留选项，后续用于元数据保留\n\n"
-       << "操作指令 (按顺序执行):\n"
-       << "  -to-gray                   彩色图像转灰度\n"
-       << "  -resize WxH[:method]       重采样到指定尺寸\n"
-       << "  -scale NxM                 按比例缩放\n"
-       << "  -rotate deg                顺时针旋转角度\n"
-       << "  -normalize                 灰度归一化\n"
-       << "  -compress fmt              压缩为指定格式\n"
-       << "  -decompress                从压缩格式解码\n"
-       << "  -save path                 在管线中途保存快照\n"
-       << "  -display                   调用窗口展示结果\n";
+    os << "用法: imagick [选项] <输入> <输出>\n"
+       << "示例: imagick -g data/color-block.ppm out/gray.pgm\n"
+       << "      imagick -r 50 data/lena-512-gray.ppm out/lena-256.pgm\n\n"
+       << "  -h, --help                     显示本帮助并退出\n"
+       << "  -g, --grayscale                将图像转换为灰度\n"
+       << "  -r, --resize <percentage>      依据百分比对长宽等比例缩放\n"
+       << "  -c, --compress                 按默认格式压缩图像\n"
+       << "  -x, --extract                  从压缩数据解码图像\n"
+       << "  -t, --triples                  导出非零像素三元组\n";
 }
 
 bool operationRequiresArgument(OperationType type) {
     switch (type) {
-    case OperationType::Resize:
-    case OperationType::Scale:
-    case OperationType::Rotate:
-    case OperationType::Compress:
-    case OperationType::Save:
+    case OperationType::ScalePercent:
         return true;
-    case OperationType::ToGray:
-    case OperationType::Normalize:
+    case OperationType::Compress:
     case OperationType::Decompress:
-    case OperationType::Display:
+    case OperationType::Grayscale:
+    case OperationType::DumpTriples:
         return false;
     }
     throw std::logic_error("未知的操作类型");
 }
 
-std::string_view operationLabel(OperationType type) {
-    switch (type) {
-    case OperationType::ToGray:
-        return "to-gray";
-    case OperationType::Resize:
-        return "resize";
-    case OperationType::Scale:
-        return "scale";
-    case OperationType::Rotate:
-        return "rotate";
-    case OperationType::Normalize:
-        return "normalize";
-    case OperationType::Compress:
-        return "compress";
-    case OperationType::Decompress:
-        return "decompress";
-    case OperationType::Save:
-        return "save";
-    case OperationType::Display:
-        return "display";
-    }
-    throw std::logic_error("未知的操作类型");
-}
-
 OperationType parseOperationToken(const std::string& token) {
-    if (token == "-to-gray" || token == "-grayscale") {
-        return OperationType::ToGray;
-    }
-    if (token == "-resize") {
-        return OperationType::Resize;
-    }
-    if (token == "-scale") {
-        return OperationType::Scale;
-    }
-    if (token == "-rotate") {
-        return OperationType::Rotate;
-    }
-    if (token == "-normalize") {
-        return OperationType::Normalize;
-    }
-    if (token == "-compress") {
+    if (token == "-c" || token == "--compress") {
         return OperationType::Compress;
     }
-    if (token == "-decompress") {
+    if (token == "-x" || token == "--extract") {
         return OperationType::Decompress;
     }
-    if (token == "-save") {
-        return OperationType::Save;
+    if (token == "-g" || token == "--grayscale") {
+        return OperationType::Grayscale;
     }
-    if (token == "-display") {
-        return OperationType::Display;
+    if (token == "-r" || token == "--resize") {
+        return OperationType::ScalePercent;
+    }
+    if (token == "-t" || token == "--triples") {
+        return OperationType::DumpTriples;
     }
     throw std::runtime_error("未知的操作指令: " + token);
+}
+
+double parseScalePercentage(const std::string& token) {
+    if (token.empty()) {
+        throw std::runtime_error("-r 参数不能为空");
+    }
+
+    std::string numeric = token;
+    if (numeric.back() == '%') {
+        numeric.pop_back();
+    }
+    if (numeric.empty()) {
+        throw std::runtime_error("-r 参数不能为空");
+    }
+
+    std::size_t parsed = 0;
+    double value = 0.0;
+    try {
+        value = std::stod(numeric, &parsed);
+    } catch (const std::invalid_argument&) {
+        throw std::runtime_error("无法解析缩放百分比: " + token);
+    } catch (const std::out_of_range&) {
+        throw std::runtime_error("缩放百分比超出范围: " + token);
+    }
+
+    if (parsed != numeric.size()) {
+        throw std::runtime_error("缩放百分比包含无法识别的字符: " + token);
+    }
+    if (value <= 0.0) {
+        throw std::runtime_error("缩放百分比必须大于 0");
+    }
+
+    return value / 100.0;
 }
 
 CLIConfig parseArguments(int argc, char** argv) {
@@ -150,47 +124,6 @@ CLIConfig parseArguments(int argc, char** argv) {
             std::exit(EXIT_SUCCESS);
         }
 
-        if (arg == "--info") {
-            config.infoOnly = true;
-            continue;
-        }
-        if (arg == "--ascii") {
-            if (config.forceAscii && !*config.forceAscii) {
-                throw std::runtime_error("--ascii 与 --binary 冲突");
-            }
-            config.forceAscii = true;
-            continue;
-        }
-        if (arg == "--binary") {
-            if (config.forceAscii && *config.forceAscii) {
-                throw std::runtime_error("--ascii 与 --binary 冲突");
-            }
-            config.forceAscii = false;
-            continue;
-        }
-        if (arg == "--max-value") {
-            if (i + 1 >= argc) {
-                throw std::runtime_error("--max-value 需要一个整数参数");
-            }
-            const std::string valueToken = argv[++i];
-            try {
-                const int value = std::stoi(valueToken);
-                if (value <= 0) {
-                    throw std::runtime_error("--max-value 必须大于 0");
-                }
-                config.maxValueOverride = value;
-            } catch (const std::invalid_argument&) {
-                throw std::runtime_error("--max-value 参数不是有效整数: " + valueToken);
-            } catch (const std::out_of_range&) {
-                throw std::runtime_error("--max-value 参数超出整数范围: " + valueToken);
-            }
-            continue;
-        }
-        if (arg == "--keep-metadata") {
-            config.keepMetadata = true;
-            continue;
-        }
-
         if (!arg.empty() && arg[0] == '-') {
             OperationType type = parseOperationToken(arg);
             std::string parameter;
@@ -207,51 +140,42 @@ CLIConfig parseArguments(int argc, char** argv) {
         positional.push_back(arg);
     }
 
-    if (positional.empty()) {
-        throw std::runtime_error("缺少输入资源路径");
-    }
-    if (positional.size() > 2) {
-        throw std::runtime_error("最多只能指定一个输入和一个输出资源");
+    if (positional.size() != 2) {
+        throw std::runtime_error("请指定输入文件路径和输出文件路径");
     }
 
     config.inputPath = positional.front();
-    if (positional.size() == 2) {
-        config.outputPath = positional.back();
-    }
+    config.outputPath = positional.back();
 
     return config;
 }
 
-void reportPlan(const CLIConfig& config) {
-    std::cout << "命令解析成功。" << std::endl;
-    std::cout << "输入资源: " << config.inputPath << std::endl;
-    std::cout << "输出资源: " << config.outputPath << std::endl;
-    if (config.infoOnly) {
-        std::cout << "已启用 --info" << std::endl;
-    }
-    if (config.forceAscii.has_value()) {
-        std::cout << "写出模式: " << (*config.forceAscii ? "ASCII" : "Binary") << std::endl;
-    }
-    if (config.maxValueOverride.has_value()) {
-        std::cout << "写出最大像素值: " << *config.maxValueOverride << std::endl;
-    }
-    if (config.keepMetadata) {
-        std::cout << "保留元数据选项已记录 (功能待实现)" << std::endl;
-    }
-    if (config.operations.empty()) {
-        std::cout << "操作序列为空，后续将扩展默认行为。" << std::endl;
-    } else {
-        std::cout << "操作序列:" << std::endl;
-        for (std::size_t index = 0; index < config.operations.size(); ++index) {
-            const auto& op = config.operations[index];
-            std::cout << "  [" << index << "] " << operationLabel(op.type);
-            if (!op.parameter.empty()) {
-                std::cout << " " << op.parameter;
-            }
-            std::cout << std::endl;
+cv::Mat runOperations(const std::string& inputPath, const std::vector<Operation>& operations, int& maxValue, bool& preferBinaryColor) {
+    ImageData data = ImageLoader::load(inputPath);
+    maxValue = data.maxValue;
+    preferBinaryColor = data.magic == "P6";
+
+    cv::Mat current = data.image.clone();
+
+    for (const Operation& op : operations) {
+        switch (op.type) {
+        case OperationType::Grayscale:
+            current = ImageOps::toGrayscale(current);
+            break;
+        case OperationType::ScalePercent: {
+            const double factor = parseScalePercentage(op.parameter);
+            current = ImageOps::scaleByPercentage(current, factor);
+            break;
+        }
+        case OperationType::Compress:
+        case OperationType::Decompress:
+        case OperationType::DumpTriples:
+            throw std::logic_error("压缩和解压操作应在主函数中处理");
         }
     }
-    std::cout << "图像处理管线的执行逻辑将在后续步骤实现。" << std::endl;
+
+    preferBinaryColor = (current.depth() == CV_8U && current.channels() == 3);
+    return current;
 }
 
 } // namespace
@@ -259,7 +183,66 @@ void reportPlan(const CLIConfig& config) {
 int main(int argc, char** argv) {
     try {
         const CLIConfig config = parseArguments(argc, argv);
-        reportPlan(config);
+        
+        bool hasDecompress = false;
+        bool hasTripleDump = false;
+        for (const auto& op : config.operations) {
+            hasDecompress |= (op.type == OperationType::Decompress);
+            hasTripleDump |= (op.type == OperationType::DumpTriples);
+        }
+        
+        if (hasDecompress) {
+            if (config.operations.size() != 1) {
+                throw std::runtime_error("解压参数过多");
+            }
+            
+            const ImageData data = ImageLoader::decompress(config.inputPath);
+            const bool useBinaryColor = (data.image.depth() == CV_8U && data.image.channels() == 3);
+            ImageLoader::save(config.outputPath, data.image, data.maxValue, useBinaryColor);
+            std::cout << "解压完成，结果已保存到: " << config.outputPath << std::endl;
+            return EXIT_SUCCESS;
+        }
+
+        if (hasTripleDump) {
+            if (config.operations.size() != 1) {
+                throw std::runtime_error("导出三元组当前仅支持单独使用 -t");
+            }
+
+            const ImageData data = ImageLoader::load(config.inputPath);
+            ImageLoader::saveTriples(config.outputPath, data.image, data.maxValue);
+            std::cout << "三元组导出完成，已写入: " << config.outputPath << std::endl;
+            return EXIT_SUCCESS;
+        }
+        
+        std::vector<Operation> pipelineOps;
+        pipelineOps.reserve(config.operations.size());
+        bool hadCompress = false;
+        for (std::size_t i = 0; i < config.operations.size(); ++i) {
+            const auto& op = config.operations[i];
+            if (op.type == OperationType::Compress) {
+                if (hadCompress) {
+                    throw std::runtime_error("-c 不能重复出现");
+                }
+                if (i + 1 != config.operations.size()) {
+                    throw std::runtime_error("-c 必须位于操作序列末尾");
+                }
+                hadCompress = true;
+            } else {
+                pipelineOps.push_back(op);
+            }
+        }
+
+        int maxValue = 255;
+        bool preferBinaryColor = false;
+        const cv::Mat result = runOperations(config.inputPath, pipelineOps, maxValue, preferBinaryColor);
+
+        if (hadCompress) {
+            ImageLoader::compress(config.outputPath, result, maxValue);
+            std::cout << "压缩完成，已写入: " << config.outputPath << std::endl;
+        } else {
+            ImageLoader::save(config.outputPath, result, maxValue, preferBinaryColor);
+            std::cout << "处理完成，已保存到: " << config.outputPath << std::endl;
+        }
     } catch (const std::exception& ex) {
         std::cerr << "错误: " << ex.what() << std::endl;
         std::cerr << "使用 --help 查看命令说明。" << std::endl;

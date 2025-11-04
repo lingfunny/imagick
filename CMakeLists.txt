@@ -11,6 +11,7 @@ find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc highgui)
 add_executable(imagick
     src/main.cpp
     src/ImageLoader.cpp
+    src/ImageOps.cpp
 )
 
 target_include_directories(imagick

@@ -5,6 +5,8 @@
 #include <vector>
 
 #include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include "ImageLoader.hpp"
 #include "ImageOps.hpp"
@@ -16,7 +18,8 @@ enum class OperationType {
     Decompress,
     Grayscale,
     ScalePercent,
-    DumpTriples
+    DumpTriples,
+    Show
 };
 
 struct Operation {
@@ -39,13 +42,15 @@ void printUsage(std::ostream& os) {
        << "  -r, --resize <percentage>      依据百分比对长宽等比例缩放\n"
        << "  -c, --compress                 按默认格式压缩图像\n"
        << "  -x, --extract                  从压缩数据解码图像\n"
-       << "  -t, --triples                  导出非零像素三元组\n";
+       << "  -t, --triples                  导出非零像素三元组\n"
+       << "  -s, --show                     在窗口中预览处理结果\n";
 }
 
 bool operationRequiresArgument(OperationType type) {
     switch (type) {
     case OperationType::ScalePercent:
         return true;
+    case OperationType::Show:
     case OperationType::Compress:
     case OperationType::Decompress:
     case OperationType::Grayscale:
@@ -70,6 +75,9 @@ OperationType parseOperationToken(const std::string& token) {
     }
     if (token == "-t" || token == "--triples") {
         return OperationType::DumpTriples;
+    }
+    if (token == "-s" || token == "--show") {
+        return OperationType::Show;
     }
     throw std::runtime_error("未知的操作指令: " + token);
 }
@@ -140,7 +148,10 @@ CLIConfig parseArguments(int argc, char** argv) {
         positional.push_back(arg);
     }
 
-    if (positional.size() != 2) {
+    if (positional.empty()) {
+        throw std::runtime_error("请指定输入文件路径");
+    }
+    if (positional.size() > 2) {
         throw std::runtime_error("请指定输入文件路径和输出文件路径");
     }
 
@@ -148,6 +159,22 @@ CLIConfig parseArguments(int argc, char** argv) {
     config.outputPath = positional.back();
 
     return config;
+}
+
+void showImage(const cv::Mat& image, const std::string& windowTitle) {
+    if (image.empty()) {
+        throw std::runtime_error("无法展示空图像");
+    }
+    cv::Mat converted;
+    const cv::Mat* toDisplay = &image;
+    if (image.channels() == 3) {
+        cv::cvtColor(image, converted, cv::COLOR_RGB2BGR);
+        toDisplay = &converted;
+    }
+    cv::namedWindow(windowTitle, cv::WINDOW_AUTOSIZE);
+    cv::imshow(windowTitle, *toDisplay);
+    cv::waitKey(0);
+    cv::destroyWindow(windowTitle);
 }
 
 cv::Mat runOperations(const std::string& inputPath, const std::vector<Operation>& operations, int& maxValue, bool& preferBinaryColor) {
@@ -167,6 +194,9 @@ cv::Mat runOperations(const std::string& inputPath, const std::vector<Operation>
             current = ImageOps::scaleByPercentage(current, factor);
             break;
         }
+        case OperationType::Show:
+            showImage(current, "result");
+            break;
         case OperationType::Compress:
         case OperationType::Decompress:
         case OperationType::DumpTriples:
@@ -186,18 +216,32 @@ int main(int argc, char** argv) {
         
         bool hasDecompress = false;
         bool hasTripleDump = false;
+        bool hasShow = false;
         for (const auto& op : config.operations) {
             hasDecompress |= (op.type == OperationType::Decompress);
             hasTripleDump |= (op.type == OperationType::DumpTriples);
+            hasShow |= (op.type == OperationType::Show);
         }
         
         if (hasDecompress) {
-            if (config.operations.size() != 1) {
-                throw std::runtime_error("解压参数过多");
+            for (std::size_t i = 0; i < config.operations.size(); ++i) {
+                const auto type = config.operations[i].type;
+                if (type == OperationType::Show) {
+                    if (i + 1 != config.operations.size()) {
+                        throw std::runtime_error("-s 必须位于操作序列末尾");
+                    }
+                    continue;
+                }
+                if (type != OperationType::Decompress) {
+                    throw std::runtime_error("解压模式下仅支持 -x 以及可选的 -s");
+                }
             }
             
             const ImageData data = ImageLoader::decompress(config.inputPath);
             const bool useBinaryColor = (data.image.depth() == CV_8U && data.image.channels() == 3);
+            if (hasShow) {
+                showImage(data.image, "result");
+            }
             ImageLoader::save(config.outputPath, data.image, data.maxValue, useBinaryColor);
             std::cout << "解压完成，结果已保存到: " << config.outputPath << std::endl;
             return EXIT_SUCCESS;
@@ -205,7 +249,7 @@ int main(int argc, char** argv) {
 
         if (hasTripleDump) {
             if (config.operations.size() != 1) {
-                throw std::runtime_error("导出三元组当前仅支持单独使用 -t");
+                throw std::runtime_error("仅支持单独使用 -t");
             }
 
             const ImageData data = ImageLoader::load(config.inputPath);

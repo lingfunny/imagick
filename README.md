@@ -2,6 +2,7 @@
 
 - 学号 24344064
 - 姓名 廖海涛
+- 项目地址 [https://github.com/lingfunny/imagick](https://github.com/lingfunny/imagick)
 
 [TOC]
 
